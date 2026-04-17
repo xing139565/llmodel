@@ -4,6 +4,8 @@ import logging
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
 import chromadb
+import pickle
+import jieba
 
 from utils.doc_parser import parse_file, chunk_text
 
@@ -69,7 +71,7 @@ def main():
     
     total_chunk_count = 0
     for doc in parsed_docs:
-        chunks = chunk_text(doc["text"], chunk_size=500, chunk_overlap=100)
+        chunks = chunk_text(doc["text"], chunk_size=500, chunk_overlap=100, ext=doc.get("ext", ""))
         for i, text_chunk in enumerate(chunks):
             metadata = {
                 "source": doc["source"],
@@ -119,6 +121,20 @@ def main():
             ids=all_ids[i:end_idx]
         )
         logger.info(f"已写入 batch {i//batch_size + 1}/{total_batches}")
+
+    logger.info("开始提取中文分词构建 BM25 数据集...")
+    tokenized_corpus = [jieba.lcut(chunk) for chunk in all_chunks]
+    
+    bm25_data = {
+        "chunks": all_chunks,
+        "metadatas": all_metadatas,
+        "ids": all_ids,
+        "tokenized_corpus": tokenized_corpus
+    }
+    
+    with open("data/bm25_corpus.pkl", "wb") as f:
+        pickle.dump(bm25_data, f)
+    logger.info("已成功保存 BM25 数据集: data/bm25_corpus.pkl")
 
     logger.info("写入向量库完成")
 

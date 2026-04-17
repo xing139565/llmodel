@@ -98,12 +98,76 @@ def parse_file(file_path: str) -> dict:
         "source": source,
         "category": category,
         "path": file_path,
-        "text": text
+        "text": text,
+        "ext": ext
     }
 
-def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100) -> list:
+def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 100, ext: str = "") -> list:
+    if ext == ".md":
+        return markdown_semantic_chunker(text, chunk_size, chunk_overlap)
+        
     seps = ["\n\n", "\n", "。", "！", "？", "；", "，", " "]
     return _recursive_split(text, seps, chunk_size, chunk_overlap)
+
+
+def markdown_semantic_chunker(text: str, chunk_size: int, chunk_overlap: int) -> list:
+    lines = text.split("\n")
+    chunks = []
+    
+    current_content = []
+    current_headers = {}
+    current_depth = 0
+    
+    def _build_parent_context(heads, depth):
+        parents = [heads[d] for d in sorted(heads.keys()) if d < depth]
+        if not parents:
+            return ""
+        return "【上下文：" + " > ".join(parents) + "】\n"
+
+    for line in lines:
+        header_match = re.match(r'^(#{1,6})\s+(.*)', line)
+        if header_match:
+            depth = len(header_match.group(1))
+            header_text = header_match.group(2).strip()
+            
+            if current_content:
+                block_text = "\n".join(current_content).strip()
+                if block_text:
+                    context = _build_parent_context(current_headers, current_depth)
+                    combined_text = context + block_text
+                    if len(combined_text) > chunk_size:
+                        sub_chunks = _recursive_split(combined_text, ["\n\n", "\n", "。", "！", "？", "；", "，", " "], chunk_size, chunk_overlap)
+                        chunks.extend(sub_chunks)
+                    else:
+                        chunks.append(combined_text)
+            
+            current_content = [line]
+            current_depth = depth
+            
+            current_headers[depth] = header_text
+            keys_to_remove = [k for k in list(current_headers.keys()) if k > depth]
+            for k in keys_to_remove:
+                del current_headers[k]
+                
+        else:
+            current_content.append(line)
+            
+    if current_content:
+        block_text = "\n".join(current_content).strip()
+        if block_text:
+            context = _build_parent_context(current_headers, current_depth)
+            combined_text = context + block_text
+            if len(combined_text) > chunk_size:
+                sub_chunks = _recursive_split(combined_text, ["\n\n", "\n", "。", "！", "？", "；", "，", " "], chunk_size, chunk_overlap)
+                chunks.extend(sub_chunks)
+            else:
+                chunks.append(combined_text)
+                
+    if not chunks:
+        seps = ["\n\n", "\n", "。", "！", "？", "；", "，", " "]
+        return _recursive_split(text, seps, chunk_size, chunk_overlap)
+        
+    return chunks
 
 def _recursive_split(text: str, separators: list, chunk_size: int, chunk_overlap: int) -> list:
     if not text:

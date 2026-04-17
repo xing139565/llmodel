@@ -10,8 +10,24 @@ import json
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import chromadb
 import logging
+import pickle
+import jieba
+from rank_bm25 import BM25Okapi
+import os
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+# 添加跨域资源共享 (CORS) 配置，允许前端调用
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 线上环境建议改成具体的域名，如 ["http://localhost:8080"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 1. embedding模型
 embedding_model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
@@ -20,6 +36,21 @@ reranker = CrossEncoder("BAAI/bge-reranker-base")
 # 2. 向量数据库 (持久化)
 chroma_client = chromadb.PersistentClient(path="./data/chroma_db")
 collection = chroma_client.get_or_create_collection(name="docs")
+
+# 3. BM25 索引 (如果存在)
+bm25_model = None
+bm25_chunks = []
+bm25_metadatas = []
+if os.path.exists("./data/bm25_corpus.pkl"):
+    try:
+        with open("./data/bm25_corpus.pkl", "rb") as f:
+            bm25_data = pickle.load(f)
+            bm25_model = BM25Okapi(bm25_data["tokenized_corpus"])
+            bm25_chunks = bm25_data["chunks"]
+            bm25_metadatas = bm25_data["metadatas"]
+            logging.info("Successfully loaded BM25 corpus.")
+    except Exception as e:
+        logging.error(f"Error loading BM25: {e}")
 
 class Query(BaseModel):
     question: str
@@ -215,39 +246,61 @@ def chat(query: Query):
         logging.info("Triggered Global Menu Bypass!")
         context, sources = retrieve_for_global_query()
     else:
-        query_embedding = embedding_model.encode(search_query).tolist()
-        
         where_filter = get_where_filter(route_type)
+        
+        # 1. 向量检索 (ChromaDB)
+        query_embedding = embedding_model.encode(search_query).tolist()
+        chroma_kwargs = {"query_embeddings": [query_embedding], "n_results": 15}
         if where_filter:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=20,
-                where=where_filter
-            )
-            docs = results.get("documents", [[]])[0]
-            metas = results.get("metadatas", [[]])[0]
+            chroma_kwargs["where"] = where_filter
+            
+        results = collection.query(**chroma_kwargs)
+        chroma_docs = results.get("documents", [[]])[0]
+        chroma_metas = results.get("metadatas", [[]])[0]
 
-            if not docs:
-                results = collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=20
-                )
-        else:
-            results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=20
-            )
+        if not chroma_docs and where_filter:
+            # 过滤条件无结果时降级兜底
+            results = collection.query(query_embeddings=[query_embedding], n_results=15)
+            chroma_docs = results.get("documents", [[]])[0]
+            chroma_metas = results.get("metadatas", [[]])[0]
 
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
+        # 2. 关键词检索 (BM25)
+        bm25_docs = []
+        bm25_meta_list = []
+        if bm25_model is not None:
+            tokenized_query = jieba.lcut(search_query)
+            scores = bm25_model.get_scores(tokenized_query)
+            doc_scores = [(idx, score) for idx, score in enumerate(scores)]
+            doc_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            for idx, score in doc_scores[:15]:
+                if score > 0:
+                    if where_filter:
+                        k = list(where_filter.keys())[0]
+                        v = where_filter[k]
+                        if bm25_metadatas[idx].get(k) != v:
+                            continue
+                    bm25_docs.append(bm25_chunks[idx])
+                    bm25_meta_list.append(bm25_metadatas[idx])
 
-        if not docs:
+        # 3. 取并集去重 (Deduplication)
+        docs_set = set()
+        combined_docs = []
+        combined_metas = []
+        
+        for d, m in zip(chroma_docs + bm25_docs, chroma_metas + bm25_meta_list):
+            if d not in docs_set:
+                docs_set.add(d)
+                combined_docs.append(d)
+                combined_metas.append(m)
+
+        if not combined_docs:
             context = "当前检索不到任何相关内容片段。"
         else:
-            pairs = [[search_query, doc] for doc in docs]
+            pairs = [[search_query, doc] for doc in combined_docs]
             scores = reranker.predict(pairs)
             
-            scored_results = list(zip(docs, metas, scores))
+            scored_results = list(zip(combined_docs, combined_metas, scores))
             scored_results.sort(key=lambda x: x[2], reverse=True)
             
             top_k = min(5, len(scored_results))
