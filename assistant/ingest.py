@@ -77,7 +77,7 @@ def main():
                 "chunk_index": i,
                 "file_path": str(doc["path"])
             }
-            chunk_id = f"{doc['source']}-{i}"
+            chunk_id = f"{doc['category']}::{doc['source']}::{i}"
             
             all_chunks.append(text_chunk)
             all_metadatas.append(metadata)
