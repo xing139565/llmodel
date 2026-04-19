@@ -65,7 +65,10 @@ def call_ollama(prompt):
             json={
                 "model": "qwen2.5:7b",
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "options": {
+                    "num_ctx": 32768
+                }
             },
             timeout=60
         )
@@ -187,7 +190,14 @@ def call_ollama_stream(prompt: str, sources: list, route_type: str):
     try:
         with requests.post(
             "http://localhost:11434/api/generate",
-            json={"model": "qwen2.5:7b", "prompt": prompt, "stream": True},
+            json={
+                "model": "qwen2.5:7b",
+                "prompt": prompt,
+                "stream": True,
+                "options": {
+                    "num_ctx": 32768
+                }
+            },
             stream=True,
             timeout=180
         ) as r:
@@ -217,8 +227,8 @@ def retrieve_for_global_query():
         matched_parts.append(f"【来源：{source}】\n{doc}")
         sources.append(source)
     
-    # 防止溢出上下文窗口，取前三十个核心块
-    matched_parts = matched_parts[:30]
+    # 防止溢出上下文窗口，取前150个核心块（通过拓展到更大的上下文窗口处理全量数据）
+    matched_parts = matched_parts[:150]
     return "\n\n".join(matched_parts), list(set(sources))
 
 
@@ -250,7 +260,7 @@ def chat(query: Query):
         
         # 1. 向量检索 (ChromaDB)
         query_embedding = embedding_model.encode(search_query).tolist()
-        chroma_kwargs = {"query_embeddings": [query_embedding], "n_results": 15}
+        chroma_kwargs = {"query_embeddings": [query_embedding], "n_results": 60}
         if where_filter:
             chroma_kwargs["where"] = where_filter
             
@@ -260,7 +270,7 @@ def chat(query: Query):
 
         if not chroma_docs and where_filter:
             # 过滤条件无结果时降级兜底
-            results = collection.query(query_embeddings=[query_embedding], n_results=15)
+            results = collection.query(query_embeddings=[query_embedding], n_results=60)
             chroma_docs = results.get("documents", [[]])[0]
             chroma_metas = results.get("metadatas", [[]])[0]
 
@@ -273,7 +283,7 @@ def chat(query: Query):
             doc_scores = [(idx, score) for idx, score in enumerate(scores)]
             doc_scores.sort(key=lambda x: x[1], reverse=True)
             
-            for idx, score in doc_scores[:15]:
+            for idx, score in doc_scores[:60]:
                 if score > 0:
                     if where_filter:
                         k = list(where_filter.keys())[0]
@@ -303,9 +313,22 @@ def chat(query: Query):
             scored_results = list(zip(combined_docs, combined_metas, scores))
             scored_results.sort(key=lambda x: x[2], reverse=True)
             
-            top_k = min(5, len(scored_results))
-            top_docs = [item[0] for item in scored_results[:top_k]]
-            top_metas = [item[1] for item in scored_results[:top_k]]
+            # 动态阈值截取策略 (扩容 + 及格线)：
+            # 1. 强制保底录取前 3 个片段，即使它们得分极低，也避免无材料可用。
+            # 2. 录取所有交叉打分 (Logits) > -1.0 的相关片段。
+            # 3. 为防止上下文撑爆显存或断崖式拉低速度，硬性截断封顶在 40 个片段。
+            top_docs = []
+            top_metas = []
+            for d, m, s in scored_results:
+                if len(top_docs) < 3:
+                    top_docs.append(d)
+                    top_metas.append(m)
+                elif s > -1.0 and len(top_docs) < 40:
+                    top_docs.append(d)
+                    top_metas.append(m)
+                else:
+                    if len(top_docs) >= 40 or s <= -1.0:
+                        break
             
             context = "\n\n---\n\n".join(top_docs)
             sources = list(set([m.get("source", "未知文件") for m in top_metas]))
